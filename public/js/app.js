@@ -1,0 +1,857 @@
+/* app.js —— 交互、字宽测量、字号搜索、修订对照、渲染与打印 */
+(function () {
+  'use strict';
+
+  var PX_PER_MM = window.LabelLayout.PX_PER_MM;
+  var MIN_BODY = 12, MAX_BODY = 24;
+  var TITLE_RATIO = 1.4;          // 标题字号 = 正文 × 1.4
+  var PADDING_MM = 8;             // 展签内边距
+  var COL_GAP_MM = 6;             // 双栏模式下中英两栏的栏间距
+  var TITLE_LINE_HEIGHT = 1.3;
+  var BODY_LINE_HEIGHT = 1.6;
+  var TITLE_GAP_PX_FACTOR = 0.5;  // 标题与正文间距 = 0.5 个正文字号
+  var PARA_GAP_PX_FACTOR = 0.6;   // 段间距 = 0.6 个正文字号
+  var REV_LIMIT = 300;            // 修订稿字数上限（按 Unicode 字符计）
+  var PROTECT_MAX = 20;           // 专名保护词数量上限
+  var PROTECT_MAX_LEN = 12;       // 单个专名保护词的 Unicode 字符上限
+  var QR_BAND_MM = 22;            // 底部为二维码固定留出的区域高度
+  var QR_IMG_MM = 18;             // 二维码码图边长
+  var QR_MIN_BLANK_MM = 2;        // 码图四周最少空白
+  var QR_MAX_BYTES = 100;         // 链接 UTF-8 字节上限
+
+  var el = {
+    title: document.getElementById('title'),
+    body: document.getElementById('body'),
+    bodyEn: document.getElementById('bodyEn'),
+    qrLink: document.getElementById('qrLink'),
+    qrHint: document.getElementById('qrHint'),
+    bodyRev: document.getElementById('bodyRev'),
+    revCount: document.getElementById('revCount'),
+    protect: document.getElementById('protect'),
+    protectHint: document.getElementById('protectHint'),
+    widthMm: document.getElementById('widthMm'),
+    heightMm: document.getElementById('heightMm'),
+    printBtn: document.getElementById('printBtn'),
+    status: document.getElementById('status'),
+    stage: document.getElementById('stage'),
+    label: document.getElementById('label'),
+    labelTitle: document.getElementById('labelTitle'),
+    labelContent: document.getElementById('labelContent'),
+    labelBody: document.getElementById('labelBody'),
+    labelBodyEn: document.getElementById('labelBodyEn'),
+    labelQr: document.getElementById('labelQr'),
+    qrCanvas: document.getElementById('qrCanvas'),
+    labelError: document.getElementById('labelError'),
+    compare: document.getElementById('compare'),
+    diffView: document.getElementById('diffView'),
+    diffStats: document.getElementById('diffStats'),
+    fitBody: document.getElementById('fitBody'),
+    fitDelta: document.getElementById('fitDelta'),
+    finalOrig: document.getElementById('finalOrig'),
+    finalRev: document.getElementById('finalRev')
+  };
+
+  // ---------- Canvas 实际字宽测量（按 font 分别缓存） ----------
+  // 正文与标题（加粗、1.4×）字号不同：每 font 一个独立 context，
+  // 避免交替调用互相改写 ctx.font；缓存也按 font 隔离，避免拼接 key 碰撞。
+  var measurers = {};
+
+  function makeMeasure(font) {
+    if (!measurers[font]) {
+      var context = document.createElement('canvas').getContext('2d');
+      context.font = font;
+      var cache = {};
+      measurers[font] = function (text) {
+        var v = cache[text];
+        if (v === undefined) {
+          v = context.measureText(text).width;
+          cache[text] = v;
+        }
+        return v;
+      };
+    }
+    return measurers[font];
+  }
+
+  function fontString(size, weight) {
+    var family = '"Songti SC", "Noto Serif CJK SC", "Source Han Serif SC", ' +
+                 '"SimSun", "Times New Roman", serif';
+    return (weight || 400) + ' ' + size + 'px ' + family;
+  }
+
+  // 一栏正文的渲染高度（px）：行高 + 段间距
+  function columnHeight(plan, bodyPx) {
+    if (!plan) return 0;
+    var paraGaps = (plan.paragraphs.length - 1) * bodyPx * PARA_GAP_PX_FACTOR;
+    return plan.totalLines * bodyPx * BODY_LINE_HEIGHT + paraGaps;
+  }
+
+  // ---------- 中文专名保护表解析 ----------
+  // 每行一个词：空行忽略；重复词去重；含换行以外空白（含仅空白的行）报错；
+  // 每个词 1～12 个 Unicode 字符；去重后最多 20 个。
+  // 返回 { words: string[] } 或 { error: string }。
+  function parseProtectedWords(raw) {
+    var lines = String(raw == null ? '' : raw).split(/\r\n?|\n/);
+    var words = [];
+    var seen = Object.create(null);
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+      if (line === '') continue; // 空行忽略
+      var cps = Array.from(line);
+      var hasSpace = false;
+      for (var k = 0; k < cps.length; k++) {
+        if (isWhitespaceCp(cps[k].codePointAt(0))) { hasSpace = true; break; }
+      }
+      if (hasSpace) {
+        return { error: '专名保护表第 ' + (i + 1) +
+          ' 行含换行以外的空白字符（空格、制表符等），请删除或改为每行一个词。' };
+      }
+      if (cps.length < 1 || cps.length > PROTECT_MAX_LEN) {
+        return { error: '专名保护表第 ' + (i + 1) + ' 行「' + line +
+          '」长度为 ' + cps.length + ' 个字符，需为 1～' + PROTECT_MAX_LEN +
+          ' 个 Unicode 字符。' };
+      }
+      if (!seen[line]) {
+        seen[line] = true;
+        words.push(line);
+      }
+    }
+    if (words.length > PROTECT_MAX) {
+      return { error: '专名保护表去重后有 ' + words.length +
+        ' 个词，超过上限 ' + PROTECT_MAX + ' 个，请删减。' };
+    }
+    return { words: words };
+  }
+
+  // 换行（\n/\r，已按行切分）以外的 Unicode 空白
+  function isWhitespaceCp(ch) {
+    if (ch === 0x20 || ch === 0x09 || ch === 0x0b || ch === 0x0c ||
+        ch === 0xa0 || ch === 0x1680 || ch === 0x2028 || ch === 0x2029 ||
+        ch === 0x202f || ch === 0x205f || ch === 0x3000 || ch === 0xfeff) {
+      return true;
+    }
+    return ch >= 0x2000 && ch <= 0x200a;
+  }
+
+  // ---------- 展品介绍链接校验 ----------
+  // 空链接（或仅空白）→ null：不生成二维码，恢复原版式；
+  // 合法 → { text, bytes }；非法 → { error }。
+  // 规则：https:// 开头的完整链接、不含空白/控制字符、UTF-8 编码 ≤ 100 字节。
+  function parseQrLink(raw) {
+    var text = String(raw == null ? '' : raw).trim();
+    if (!text) return null;
+    if (/\s/.test(text)) {
+      return { error: '链接中不能包含空格、换行等空白字符。' };
+    }
+    // eslint-disable-next-line no-control-regex
+    if (/[\x00-\x1f\x7f]/.test(text)) {
+      return { error: '链接中不能包含不可见的控制字符。' };
+    }
+    var url;
+    try {
+      url = new URL(text);
+    } catch (e) {
+      return { error: '链接格式无效：请输入完整链接，如 https://example.com/item/123 。' };
+    }
+    if (url.protocol !== 'https:') {
+      return { error: '仅支持 https:// 开头的链接（当前为 ' +
+        (url.protocol.replace(/:$/, '') || '未知协议') + '://）。' };
+    }
+    if (!url.hostname) {
+      return { error: '链接缺少主机名，如 https://example.com/item/123 。' };
+    }
+    var bytes = window.LabelQR.byteLength(text);
+    if (bytes > QR_MAX_BYTES) {
+      return { error: '链接 UTF-8 编码后为 ' + bytes + ' 字节，超过 ' +
+        QR_MAX_BYTES + ' 字节上限，请缩短链接。' };
+    }
+    return { text: text, bytes: bytes };
+  }
+
+  // ---------- 一次排版尝试 ----------
+  // 单栏（无英文译文）：正文占满内容宽。
+  // 双栏（填写译文）：标题横跨整签，中文/英文按扣除 6mm 栏间距后的实际栏宽
+  //                  各自独立断行，共用同一个正文字号。
+  // 填写链接（input.reserveBottomMm = 22）：先从可用高度中扣除底部二维码区，
+  //                  再按现有规则核算标题与正文。
+  // 返回 { ok:true, ... } 或 { ok:false, reason: 'config'|'width'|'height', ... }
+  // 各种返回均带 zhLines / enLines（中文/英文行数；宽度失败无法规划时为 null），
+  // 供修订对照表展示两版行数。
+  function tryLayout(input, widthMm, heightMm, bodyPx) {
+    var reserveMm = input.reserveBottomMm || 0;
+    var contentW = (widthMm - PADDING_MM * 2) * PX_PER_MM;
+    var contentH = (heightMm - PADDING_MM * 2 - reserveMm) * PX_PER_MM;
+    if (contentW <= 4 || contentH <= 4) {
+      return {
+        ok: false, reason: 'config',
+        message: reserveMm > 0
+          ? '标签尺寸过小：内边距 8mm 之外，底部还需固定留出 ' + QR_BAND_MM +
+            'mm 二维码区；请加大宽或高，或清空链接恢复原版式。'
+          : '标签尺寸过小：内边距为 8mm，请加大宽或高。'
+      };
+    }
+    // 码图 18mm + 两侧各至少 2mm 空白：内容宽度不足时无法放置二维码
+    if (reserveMm > 0 &&
+        contentW < (QR_IMG_MM + QR_MIN_BLANK_MM * 2) * PX_PER_MM) {
+      return {
+        ok: false, reason: 'config',
+        message: '标签宽度不足以放置二维码：' + QR_IMG_MM + 'mm 码图加两侧各 ' +
+          QR_MIN_BLANK_MM + 'mm 空白共需约 ' + (QR_IMG_MM + QR_MIN_BLANK_MM * 2) +
+          'mm 内容宽度（当前约 ' + Math.round(contentW / PX_PER_MM) +
+          'mm）；请加宽标签或清空链接。'
+      };
+    }
+
+    var dual = !!input.dual;
+    var hasZh = !!input.bodyTrim;
+    var hasEn = !!input.enTrim;
+
+    var titlePx = Math.round(bodyPx * TITLE_RATIO * 100) / 100;
+    var bodyMeasure = makeMeasure(fontString(bodyPx, 400));
+    var titleMeasure = makeMeasure(fontString(titlePx, 700));
+
+    // 栏宽：单栏占满；双栏扣除栏间距后平分
+    var colW = dual
+      ? (contentW - COL_GAP_MM * PX_PER_MM) / 2
+      : contentW;
+    if (colW <= 1) {
+      var narrow = [];
+      if (hasZh) narrow.push({ key: 'zh', widthMm: 0 });
+      if (dual && hasEn) narrow.push({ key: 'en', widthMm: 0 });
+      return {
+        ok: false, reason: 'width', bodyPx: bodyPx, widthFailures: narrow,
+        zhLines: null, enLines: null
+      };
+    }
+
+    // 标题横跨整签（两种模式均按内容全宽规划，允许折行）；标题与中文正文应用保护表
+    var titlePlan = null;
+    var titleWidthFail = false;
+    var pw = input.protectedWords || [];
+    if (input.titleTrim) {
+      titlePlan = window.LabelLayout.planText(input.titleTrim, contentW, titleMeasure, pw);
+      if (titlePlan.error) titleWidthFail = true;
+    }
+
+    var zhPlan = null, enPlan = null;
+    var widthFailures = [];
+    function collectFailures(key, plan, widthMm) {
+      if (plan && plan.error === 'width') {
+        widthFailures.push({ key: key, widthMm: widthMm, overflows: plan.overflows || [] });
+      }
+    }
+    if (titleWidthFail) {
+      collectFailures('title', titlePlan, contentW / PX_PER_MM);
+    }
+    if (hasZh) {
+      zhPlan = window.LabelLayout.planText(input.bodyTrim, colW, bodyMeasure, pw);
+      collectFailures('zh', zhPlan, colW / PX_PER_MM);
+    }
+    if (dual && hasEn) {
+      // 英文译文不应用中文专名保护
+      enPlan = window.LabelLayout.planText(input.enTrim, colW, bodyMeasure);
+      collectFailures('en', enPlan, colW / PX_PER_MM);
+    }
+
+    if (widthFailures.length) {
+      return {
+        ok: false, reason: 'width', bodyPx: bodyPx, widthFailures: widthFailures,
+        zhLines: zhPlan && !zhPlan.error ? zhPlan.totalLines : null,
+        enLines: enPlan && !enPlan.error ? enPlan.totalLines : null
+      };
+    }
+
+    // error 已被收集；此处仅为类型检查兜底
+    titlePlan = titlePlan && !titlePlan.error ? titlePlan : null;
+    zhPlan = zhPlan && !zhPlan.error ? zhPlan : null;
+    enPlan = enPlan && !enPlan.error ? enPlan : null;
+
+    if (!titlePlan && !zhPlan && !enPlan) {
+      return {
+        ok: true, dual: dual, titlePlan: null, zhPlan: null, enPlan: null,
+        bodyPx: bodyPx, titlePx: titlePx, contentH: 0, colWMm: colW / PX_PER_MM,
+        zhLines: 0, enLines: 0
+      };
+    }
+
+    // 高度核算：标题（横跨整签）+ 标题间距 + 较高一栏
+    var titleH = 0, titleGap = 0;
+    if (titlePlan) {
+      titleH = titlePlan.totalLines * titlePx * TITLE_LINE_HEIGHT;
+      if (zhPlan || enPlan) titleGap = bodyPx * TITLE_GAP_PX_FACTOR;
+    }
+    var zhH = columnHeight(zhPlan, bodyPx);
+    var enH = columnHeight(enPlan, bodyPx);
+    var bodyH = Math.max(zhH, enH);
+    var totalH = titleH + titleGap + bodyH;
+
+    if (totalH > contentH + 0.75) {
+      return {
+        ok: false, reason: 'height', bodyPx: bodyPx,
+        totalH: totalH, contentH: contentH,
+        zhH: zhH, enH: enH, titleH: titleH + titleGap,
+        zhLines: zhPlan ? zhPlan.totalLines : 0,
+        enLines: enPlan ? enPlan.totalLines : 0
+      };
+    }
+
+    return {
+      ok: true, dual: dual, titlePlan: titlePlan, zhPlan: zhPlan, enPlan: enPlan,
+      bodyPx: bodyPx, titlePx: titlePx, contentH: totalH,
+      zhH: zhH, enH: enH, colWMm: colW / PX_PER_MM,
+      zhLines: zhPlan ? zhPlan.totalLines : 0,
+      enLines: enPlan ? enPlan.totalLines : 0
+    };
+  }
+
+  // ---------- 12→24 中选最大可行字号 ----------
+  function computeLayout(input) {
+    var lastHeightFailure = null;
+    for (var px = MAX_BODY; px >= MIN_BODY; px--) {
+      var r = tryLayout(input, input.widthMm, input.heightMm, px);
+      if (r.ok) return r;
+      if (r.reason === 'config') return r;     // 尺寸配置错误，与字号无关
+      if (r.reason === 'width') {
+        if (px === MIN_BODY) return r;         // 最小字号仍超宽，无法挽救
+        continue;
+      }
+      if (r.reason === 'height') lastHeightFailure = r;
+    }
+    // 12px 仍超高
+    return lastHeightFailure || {
+      ok: false, reason: 'height', bodyPx: MIN_BODY, totalH: 0, contentH: 0
+    };
+  }
+
+  // ---------- 错误文案 ----------
+  var COL_NAMES = { title: '标题', zh: '中文原文栏', en: '英文译文栏' };
+
+  function pxToMm(px) { return px / PX_PER_MM; }
+
+  function widthFailureMessage(result, dual) {
+    var parts = result.widthFailures.map(function (f) {
+      var colLabel = f.key === 'title' ? '标题' : (dual ? COL_NAMES[f.key] : '正文');
+      var widthText = Math.max(0, Math.round(f.widthMm)) + 'mm';
+      // 标题按整签宽度；双栏按栏宽；单栏正文按行宽
+      var spanName = f.key === 'title' ? '整签宽度' : (dual ? '栏宽' : '行宽');
+      var protects = (f.overflows || []).filter(function (o) { return o.protect; });
+      var others = (f.overflows || []).filter(function (o) { return !o.protect; });
+      var items = [];
+
+      if (protects.length) {
+        items.push('保护词' + protects.map(function (o) {
+          return '「' + o.text + '」需要约 ' +
+            Math.round(pxToMm(o.width) * 10) / 10 + 'mm';
+        }).join('、') + '，即使 ' + result.bodyPx +
+          'px（最小字号）仍超出' + spanName + '（约 ' + widthText +
+          '），不可拆词或截断');
+      }
+      if (others.length) {
+        items.push('连续内容 ' + others.slice(0, 3).map(function (o) {
+          return '「' + o.text + '」';
+        }).join('、') + (others.length > 3 ? ' 等' : '') +
+          '即使 ' + result.bodyPx + 'px（最小字号）也无法放入' +
+          spanName + '（约 ' + widthText + '）');
+      }
+      if (!items.length) {
+        items.push('存在即使 ' + result.bodyPx + 'px（最小字号）也无法放入' +
+          spanName + '（约 ' + widthText + '）的连续内容');
+      }
+      return colLabel + items.join('；');
+    });
+    var head = dual ? '排不下（双栏）：' : '排不下：';
+    return head + parts.join('；') + '。请加宽标签' +
+      (dual ? '（加宽后两栏栏宽同步增加）' : '') +
+      '、缩短保护词或修改文案——不会拆词、截断显示。';
+  }
+
+  function heightFailureMessage(result, dual, qrReserved) {
+    var where = '';
+    if (dual) {
+      // 较高一栏（计入标题时以正文两栏比较）
+      if (result.enH > result.zhH) where = '（英文译文栏较高）';
+      else if (result.zhH > 0) where = '（中文原文栏较高）';
+    }
+    var qrNote = qrReserved
+      ? '（可用高度已先扣除底部 ' + QR_BAND_MM + 'mm 二维码区）'
+      : '';
+    return '内容在 12–24px 任何字号下都超出标签高度' + where + qrNote + '（需要约 ' +
+      Math.round(result.totalH / PX_PER_MM) + 'mm，可用 ' +
+      Math.round(result.contentH / PX_PER_MM) + 'mm）。\n' +
+      '请加高标签或精简文案' +
+      (qrReserved ? '，或清空链接恢复原版式' : '') + '——不会截断显示。';
+  }
+
+  // ---------- 渲染 ----------
+  function buildLines(container, plan) {
+    container.innerHTML = '';
+    plan.paragraphs.forEach(function (para) {
+      var p = document.createElement('div');
+      p.className = 't-paragraph';
+      para.lines.forEach(function (lineText) {
+        var div = document.createElement('div');
+        div.className = 't-line';
+        div.textContent = lineText;
+        p.appendChild(div);
+      });
+      container.appendChild(p);
+    });
+  }
+
+  function setDualMode(dual) {
+    el.labelContent.classList.toggle('dual', !!dual);
+    el.labelBodyEn.hidden = !dual;
+  }
+
+  var lastGood = null;
+  var currentQr = null; // 当前生效的二维码（LabelQR.encode 结果）；null 表示不生成
+
+  // 把 QR 模块矩阵画到 canvas 上（白底黑块；显示尺寸由 CSS 固定为 18mm，
+  // 码图之外的空白由底部 22mm 预留区与内边距保证，预览与打印共用同一 canvas）
+  function drawQr(canvas, modules) {
+    var size = modules.length;
+    var scale = 8; // 内部分辨率：每模块 8×8 像素，18mm 下约 460DPI
+    canvas.width = size * scale;
+    canvas.height = size * scale;
+    var ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#000';
+    for (var y = 0; y < size; y++) {
+      for (var x = 0; x < size; x++) {
+        if (modules[y][x]) ctx.fillRect(x * scale, y * scale, scale, scale);
+      }
+    }
+  }
+
+  // 把一次成功的排版结果写入展签 DOM 与 CSS 变量（预览与打印共用此结果）
+  function applyResult(input, result) {
+    var s = el.label.style;
+    s.setProperty('--label-w', input.widthMm + 'mm');
+    s.setProperty('--label-h', input.heightMm + 'mm');
+    s.setProperty('--body-size', result.bodyPx + 'px');
+    s.setProperty('--title-size', result.titlePx + 'px');
+    s.setProperty('--title-gap',
+      result.titlePlan && (result.zhPlan || result.enPlan)
+        ? (result.bodyPx * TITLE_GAP_PX_FACTOR) + 'px'
+        : '0px');
+    s.setProperty('--para-gap', result.bodyPx * PARA_GAP_PX_FACTOR + 'px');
+
+    el.labelError.hidden = true;
+
+    el.labelTitle.innerHTML = '';
+    if (result.titlePlan) {
+      buildLines(el.labelTitle, result.titlePlan);
+    }
+
+    el.labelBody.innerHTML = '';
+    if (result.zhPlan) {
+      buildLines(el.labelBody, result.zhPlan);
+    }
+
+    el.labelBodyEn.innerHTML = '';
+    if (result.enPlan) {
+      buildLines(el.labelBodyEn, result.enPlan);
+    }
+
+    // 二维码：填写合法链接时固定在底部 22mm 预留区内居中显示
+    if (currentQr) {
+      drawQr(el.qrCanvas, currentQr.modules);
+      el.labelQr.hidden = false;
+    } else {
+      el.labelQr.hidden = true;
+    }
+  }
+
+  // 成功状态行文案
+  function successInfo(input, result) {
+    var reserveMm = input.reserveBottomMm || 0;
+    var usedH = Math.round(result.contentH / PX_PER_MM);
+    var info = '正文字号 ' + result.bodyPx + 'px（标题 ' +
+      Math.round(result.titlePx * 10) / 10 + 'px）';
+    if (result.dual) {
+      info += '，双栏栏宽约 ' + Math.round(result.colWMm) + 'mm';
+      if (result.zhPlan) info += '，中文 ' + result.zhPlan.totalLines + ' 行';
+      if (result.enPlan) info += '，英文 ' + result.enPlan.totalLines + ' 行';
+    } else if (result.zhPlan) {
+      info += '，正文 ' + result.zhPlan.totalLines + ' 行';
+    }
+    if (result.titlePlan) info += '，标题 ' + result.titlePlan.totalLines + ' 行';
+    info += '，内容高约 ' + usedH + 'mm / ' +
+      Math.round(input.heightMm - PADDING_MM * 2 - reserveMm) + 'mm';
+    if (reserveMm > 0) info += '（底部已预留 ' + QR_BAND_MM + 'mm 二维码区）';
+    return info;
+  }
+
+  // 排版成功：预览与打印只呈现被选中的一版
+  function showSuccess(input, result, versionName) {
+    lastGood = { input: input, result: result };
+    applyResult(input, result);
+    setStatus((versionName ? '成品：' + versionName + '　' : '') +
+      successInfo(input, result), 'ok');
+    el.printBtn.disabled = false;
+    fitScale();
+  }
+
+  // 排版失败：说明超宽/超高并禁用打印；对照区在面板中保留，不受影响
+  function showFailure(input, result, versionName) {
+    var msg, tag = '';
+    if (result.reason === 'config') {
+      msg = result.message;
+    } else if (result.reason === 'width') {
+      msg = widthFailureMessage(result, input.dual);
+      tag = '超宽';
+    } else {
+      msg = heightFailureMessage(result, input.dual, (input.reserveBottomMm || 0) > 0);
+      tag = '超高';
+    }
+    var prefix = versionName
+      ? '【' + versionName + (tag ? ' · ' + tag : '') + '】'
+      : '';
+    setStatus(prefix + msg, 'err');
+    showError(prefix + (result.reason === 'config' ? '标签尺寸过小\n' + msg : msg));
+    el.printBtn.disabled = true;
+    fitScale();
+  }
+
+  // ---------- 修订对照 ----------
+  // 对照基于排版实际使用的文本（去首尾空白后的原稿与修订稿），
+  // 换行统一为 \n 后按 Unicode 字符求最短增删对齐。
+  function renderDiff(a, b) {
+    var norm = function (s) { return String(s).replace(/\r\n?/g, '\n'); };
+    var res = window.LabelDiff.align(norm(a), norm(b));
+    el.diffView.innerHTML = '';
+    if (!res.inserted && !res.deleted) {
+      el.diffView.textContent = '修订稿与原稿完全一致，无差异。';
+      el.diffStats.textContent = '';
+      return;
+    }
+    res.segments.forEach(function (seg) {
+      var node;
+      if (seg.type === 'del') node = document.createElement('del');
+      else if (seg.type === 'ins') node = document.createElement('ins');
+      else node = document.createElement('span');
+      appendSegText(node, seg.text, seg.type);
+      el.diffView.appendChild(node);
+    });
+    el.diffStats.textContent =
+      '新增 ' + res.inserted + ' 字 · 删除 ' + res.deleted + ' 字 · 相同 ' + res.kept + ' 字';
+  }
+
+  // 片段文本写入节点；换行在新增/删除片段中以 ↵ 标记显式标出
+  function appendSegText(node, text, type) {
+    var parts = text.split('\n');
+    for (var i = 0; i < parts.length; i++) {
+      if (i > 0) {
+        if (type !== 'keep') {
+          var mark = document.createElement('i');
+          mark.className = 'nl';
+          mark.textContent = '↵';
+          node.appendChild(mark);
+        }
+        node.appendChild(document.createElement('br'));
+      }
+      if (parts[i]) node.appendChild(document.createTextNode(parts[i]));
+    }
+  }
+
+  // 单版能否容纳的对照表文案
+  function fitNote(r) {
+    if (r.ok) return { text: '✓ 可容纳', bad: false };
+    if (r.reason === 'width') {
+      var protects = (r.widthFailures || []).reduce(function (acc, f) {
+        return acc.concat((f.overflows || []).filter(function (o) { return o.protect; }));
+      }, []);
+      if (protects.length) {
+        return {
+          text: '✗ 超宽：保护词「' + protects[0].text + '」12px 仍需约 ' +
+            Math.round(pxToMm(protects[0].width) * 10) / 10 + 'mm',
+          bad: true
+        };
+      }
+      return { text: '✗ 超宽：12px 仍放不进行宽', bad: true };
+    }
+    if (r.reason === 'height') {
+      return {
+        text: '✗ 超高：12px 需约 ' + Math.round(r.totalH / PX_PER_MM) +
+          'mm / 可用 ' + Math.round(r.contentH / PX_PER_MM) + 'mm',
+        bad: true
+      };
+    }
+    return { text: '✗ ' + (r.message || '尺寸无效'), bad: true };
+  }
+
+  function verBrief(r) {
+    if (r.ok) return r.bodyPx + 'px 可容纳';
+    if (r.reason === 'width') return '超宽排不下';
+    if (r.reason === 'height') return '超高排不下';
+    return '尺寸无效';
+  }
+
+  // 两版对比表 + 变化摘要
+  function renderFit(resOrig, resRev) {
+    el.fitBody.innerHTML = '';
+    [['原稿', resOrig], ['修订稿', resRev]].forEach(function (row) {
+      var name = row[0], r = row[1];
+      var note = fitNote(r);
+      var tr = document.createElement('tr');
+      [name,
+       r.ok ? r.bodyPx + 'px' : '—',
+       r.zhLines == null ? '—' : r.zhLines + ' 行',
+       note.text].forEach(function (txt, idx) {
+        var td = document.createElement('td');
+        td.textContent = txt;
+        if (idx === 3) td.className = note.bad ? 'bad' : 'good';
+        tr.appendChild(td);
+      });
+      el.fitBody.appendChild(tr);
+    });
+
+    var delta;
+    if (resOrig.ok && resRev.ok) {
+      var fs = resOrig.bodyPx === resRev.bodyPx
+        ? '字号同为 ' + resOrig.bodyPx + 'px'
+        : '字号 ' + resOrig.bodyPx + 'px → ' + resRev.bodyPx + 'px';
+      var ln = resOrig.zhLines === resRev.zhLines
+        ? '中文行数同为 ' + resOrig.zhLines + ' 行'
+        : '中文行数 ' + resOrig.zhLines + ' → ' + resRev.zhLines + ' 行';
+      delta = '变化：' + fs + '，' + ln + '；两版均可容纳。';
+    } else {
+      delta = '变化：原稿 ' + verBrief(resOrig) +
+        ' → 修订稿 ' + verBrief(resRev) + '。';
+    }
+    el.fitDelta.textContent = delta;
+  }
+
+  function render() {
+    var input = {
+      title: el.title.value,
+      body: el.body.value,
+      bodyEn: el.bodyEn.value,
+      widthMm: parseFloat(el.widthMm.value),
+      heightMm: parseFloat(el.heightMm.value)
+    };
+    input.titleTrim = input.title.trim();
+    input.bodyTrim = input.body.trim();
+    input.enTrim = input.bodyEn.trim();
+    input.dual = input.enTrim.length > 0;
+
+    // 展品介绍链接 → 底部二维码；非法或无法编码时报错并禁用打印，空链接恢复原版式
+    setDualMode(input.dual);
+    var qrParsed = parseQrLink(el.qrLink.value);
+    var qrError = qrParsed && qrParsed.error ? qrParsed.error : null;
+    currentQr = null;
+    if (!qrError && qrParsed) {
+      var qrEnc = window.LabelQR.encode(qrParsed.text);
+      if (qrEnc.error) {
+        qrError = '链接无法编码为二维码：数据超出 QR 版本 ' +
+          window.LabelQR.MAX_VERSION + '（纠错 M）约 ' + qrEnc.maxBytes +
+          ' 字节的容量上限。';
+      } else {
+        currentQr = qrEnc;
+      }
+    }
+    input.reserveBottomMm = currentQr ? QR_BAND_MM : 0;
+    el.qrHint.classList.toggle('err', !!qrError);
+    if (qrError) {
+      el.qrHint.textContent = qrError;
+      setStatus(qrError, 'err');
+      showError('展品介绍链接有误\n' + qrError);
+      el.printBtn.disabled = true;
+      fitScale();
+      return;
+    }
+    el.qrHint.textContent = currentQr
+      ? '已生成二维码：' + qrParsed.bytes + ' / ' + QR_MAX_BYTES +
+        ' 字节（版本 V' + currentQr.version + '，浏览器本地生成）'
+      : '未填写链接，不生成二维码';
+
+    // 中文专名保护表：原稿与修订稿应用同一张表；非法时禁用打印、不进行排版
+    var parsedProtect = parseProtectedWords(el.protect.value);
+    el.protectHint.classList.toggle('err', !!parsedProtect.error);
+    if (parsedProtect.error) {
+      el.protectHint.textContent = parsedProtect.error;
+      setStatus(parsedProtect.error, 'err');
+      showError('专名保护表有误\n' + parsedProtect.error);
+      el.printBtn.disabled = true;
+      fitScale();
+      return;
+    }
+    input.protectedWords = parsedProtect.words;
+    var dupCount = countNonEmptyLines(el.protect.value) - input.protectedWords.length;
+    el.protectHint.textContent = input.protectedWords.length
+      ? '已启用 ' + input.protectedWords.length + ' 个保护词' +
+        (dupCount > 0 ? '（已自动忽略 ' + dupCount + ' 个重复词）' : '')
+      : '未设置保护词';
+
+    // 修订稿非空白即进入对照模式；新填写修订稿时默认以修订稿为成品
+    var revTrim = el.bodyRev.value.trim();
+    var revActive = revTrim.length > 0;
+    if (revActive && !revWasActive) selectedVersion = 'rev';
+    if (!revActive) selectedVersion = 'orig';
+    revWasActive = revActive;
+    el.finalOrig.checked = selectedVersion === 'orig';
+    el.finalRev.checked = selectedVersion === 'rev';
+    el.compare.hidden = !revActive;
+
+    // 差异对照与尺寸无关，先行渲染（尺寸非法期间对照仍保持更新）
+    if (revActive) renderDiff(input.bodyTrim, revTrim);
+
+    if (!(input.widthMm >= 30 && input.widthMm <= 999 &&
+          input.heightMm >= 20 && input.heightMm <= 999)) {
+      setStatus('请输入有效的标签尺寸：宽 30–999mm，高 20–999mm。', 'err');
+      showError('标签尺寸无效\n（宽 30–999mm，高 20–999mm）');
+      el.printBtn.disabled = true;
+      return;
+    }
+
+    if (!revActive) {
+      var single = computeLayout(input);
+      if (!single.ok) showFailure(input, single, null);
+      else showSuccess(input, single, null);
+      return;
+    }
+
+    // 对照模式：原稿与修订稿沿用当前尺寸与英文译文，分别运行现有排版，共用同一保护表
+    var revInput = {
+      title: input.title,
+      body: el.bodyRev.value,
+      bodyEn: input.bodyEn,
+      widthMm: input.widthMm,
+      heightMm: input.heightMm,
+      protectedWords: input.protectedWords,
+      reserveBottomMm: input.reserveBottomMm
+    };
+    revInput.titleTrim = input.titleTrim;
+    revInput.bodyTrim = revTrim;
+    revInput.enTrim = input.enTrim;
+    revInput.dual = input.dual;
+
+    var resOrig = computeLayout(input);
+    var resRev = computeLayout(revInput);
+    renderFit(resOrig, resRev);
+
+    if (selectedVersion === 'rev') {
+      if (!resRev.ok) showFailure(revInput, resRev, '修订稿');
+      else showSuccess(revInput, resRev, '修订稿');
+    } else {
+      if (!resOrig.ok) showFailure(input, resOrig, '原稿');
+      else showSuccess(input, resOrig, '原稿');
+    }
+  }
+
+  // 保护表中非空行数（用于提示去重数量）
+  function countNonEmptyLines(raw) {
+    return String(raw == null ? '' : raw)
+      .split(/\r\n?|\n/)
+      .filter(function (ln) { return ln !== ''; }).length;
+  }
+
+  function showError(message) {
+    el.labelError.textContent = message;
+    el.labelError.hidden = false;
+    el.labelQr.hidden = true;
+    el.labelTitle.innerHTML = '';
+    el.labelBody.innerHTML = '';
+    el.labelBodyEn.innerHTML = '';
+  }
+
+  function setStatus(text, kind) {
+    el.status.textContent = text;
+    el.status.className = 'status' + (kind ? ' ' + kind : '');
+  }
+
+  // ---------- 屏幕预览缩放（仅显示用，不影响打印的毫米尺寸） ----------
+  function fitScale() {
+    var wMm = parseFloat(el.widthMm.value) || 120;
+    var hMm = parseFloat(el.heightMm.value) || 80;
+    var availW = el.stage.clientWidth - 24;
+    var availH = el.stage.clientHeight - 24;
+    var labelW = wMm * PX_PER_MM;
+    var labelH = hMm * PX_PER_MM;
+    var scale = Math.min(1, availW / labelW, availH / labelH);
+    if (!(scale > 0) || !isFinite(scale)) scale = 1;
+    el.label.style.transform = 'scale(' + scale + ')';
+  }
+
+  // ---------- 打印前把 @page 尺寸设为标签物理尺寸 ----------
+  var pageStyle = null;
+  function beforePrint() {
+    if (el.printBtn.disabled || !lastGood) return;
+    if (!pageStyle) {
+      pageStyle = document.createElement('style');
+      document.head.appendChild(pageStyle);
+    }
+    pageStyle.textContent = '@page { size: ' +
+      lastGood.input.widthMm + 'mm ' + lastGood.input.heightMm + 'mm; margin: 0; }';
+  }
+
+  // ---------- 初始化 ----------
+  el.body.value =
+    '新石器时代·仰韶文化，约公元前 5000–前 3000 年。\n' +
+    '泥质红陶，器表刻划有几何纹（geometric patterns），是研究黄河中游早期制陶工艺（pottery craftsmanship）的重要实物。出土于河南省渑池县仰韶村，1951 年入藏。';
+  // 英文译文默认留空：页面初次打开保持原有单栏呈现。
+  // 修订稿默认留空：不进入对照模式。
+
+  var selectedVersion = 'orig'; // 成品版本：'orig' 原稿 / 'rev' 修订稿
+  var revWasActive = false;     // 上一轮渲染时修订稿是否非空（用于新填写时默认选中修订稿）
+
+  var schedule = (function () {
+    var timer = null;
+    return function () { clearTimeout(timer); timer = setTimeout(render, 120); };
+  })();
+
+  ['input', 'change'].forEach(function (evt) {
+    el.title.addEventListener(evt, schedule);
+    el.body.addEventListener(evt, schedule);
+    el.bodyEn.addEventListener(evt, schedule);
+    el.qrLink.addEventListener(evt, schedule);
+    el.protect.addEventListener(evt, schedule);
+    el.widthMm.addEventListener(evt, schedule);
+    el.heightMm.addEventListener(evt, schedule);
+  });
+
+  // 修订稿：按 Unicode 字符计 300 字上限，超出部分截断
+  function updateRevCount(truncated) {
+    var n = Array.from(el.bodyRev.value).length;
+    el.revCount.textContent = n + ' / ' + REV_LIMIT + (truncated ? '（已按上限截断）' : '');
+    el.revCount.classList.toggle('over', n >= REV_LIMIT);
+  }
+
+  el.bodyRev.addEventListener('input', function () {
+    var cps = Array.from(el.bodyRev.value);
+    var truncated = cps.length > REV_LIMIT;
+    if (truncated) {
+      el.bodyRev.value = cps.slice(0, REV_LIMIT).join('');
+    }
+    updateRevCount(truncated);
+    schedule();
+  });
+  el.bodyRev.addEventListener('change', schedule);
+
+  // 成品版本选择：预览与打印随之切换
+  [el.finalOrig, el.finalRev].forEach(function (radio) {
+    radio.addEventListener('change', function () {
+      selectedVersion = el.finalRev.checked ? 'rev' : 'orig';
+      render();
+    });
+  });
+
+  updateRevCount(false);
+
+  el.printBtn.addEventListener('click', function () { window.print(); });
+  window.addEventListener('beforeprint', beforePrint);
+
+  var resizeTimer = null;
+  window.addEventListener('resize', function () {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(fitScale, 80);
+  });
+
+  // 字体加载完成后重排，确保测量字宽与渲染一致
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(render);
+  }
+  render();
+})();
