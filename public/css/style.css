@@ -54,6 +54,17 @@ html, body {
 .field-row { display: flex; gap: 12px; }
 .field-row .field { flex: 1; }
 
+.check-field { margin-bottom: 14px; }
+.check-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.check-line input { width: auto; margin: 0; }
+.check-line input:disabled + span { color: var(--muted); cursor: not-allowed; }
+
 .field-label {
   display: block;
   font-size: 12px;
@@ -273,8 +284,25 @@ button:disabled { background: #aaa5; cursor: not-allowed; }
   min-width: 0;
 }
 
+/* 段落对齐模式：一个容器内按对依次放置中、英段落，
+   grid 每行两列即一对段落；两栏各自独立断行、顶部对齐，
+   行与行之间沿用现有段间距（--para-gap），自动行高取同对两者较高者。 */
+.label-content.paired[hidden] { display: none; }
+.label-content.paired {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  column-gap: 6mm;
+  row-gap: var(--para-gap);
+  align-items: start;
+}
+.label-content.paired .t-paragraph {
+  min-width: 0;
+  margin-top: 0;
+}
+
 .label-title .t-line,
-.label-col .t-line {
+.label-col .t-line,
+.label-content.paired .t-line {
   white-space: pre;
   display: block;
 }

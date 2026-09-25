@@ -23,6 +23,8 @@
     title: document.getElementById('title'),
     body: document.getElementById('body'),
     bodyEn: document.getElementById('bodyEn'),
+    paraAlign: document.getElementById('paraAlign'),
+    paraAlignHint: document.getElementById('paraAlignHint'),
     qrLink: document.getElementById('qrLink'),
     qrHint: document.getElementById('qrHint'),
     bodyRev: document.getElementById('bodyRev'),
@@ -37,6 +39,7 @@
     label: document.getElementById('label'),
     labelTitle: document.getElementById('labelTitle'),
     labelContent: document.getElementById('labelContent'),
+    labelContentPaired: document.getElementById('labelContentPaired'),
     labelBody: document.getElementById('labelBody'),
     labelBodyEn: document.getElementById('labelBodyEn'),
     labelQr: document.getElementById('labelQr'),
@@ -84,6 +87,16 @@
     if (!plan) return 0;
     var paraGaps = (plan.paragraphs.length - 1) * bodyPx * PARA_GAP_PX_FACTOR;
     return plan.totalLines * bodyPx * BODY_LINE_HEIGHT + paraGaps;
+  }
+
+  // 单段渲染高度（px）：仅行高，不含段间距
+  function paragraphHeight(para, bodyPx) {
+    return para.lines.length * bodyPx * BODY_LINE_HEIGHT;
+  }
+
+  // 非空段落数：与排版核心 tokenize 的分段结果一致（去首尾空白、合并连续空白后为空的段不计）
+  function countParagraphs(text, protectedWords) {
+    return window.LabelLayout.tokenize(text || '', protectedWords).length;
   }
 
   // ---------- 中文专名保护表解析 ----------
@@ -172,10 +185,15 @@
   // 单栏（无英文译文）：正文占满内容宽。
   // 双栏（填写译文）：标题横跨整签，中文/英文按扣除 6mm 栏间距后的实际栏宽
   //                  各自独立断行，共用同一个正文字号。
+  // 双栏 + 段落对齐（input.paired）：中英正文先按换行拆成非空段落并按顺序一一配对；
+  //                  段数不一致时直接失败（reason:'mismatch'）并指出两侧段数；
+  //                  段数相等时每对仍按各自栏宽独立断行，但高度按「段对」核算——
+  //                  每段对高度取中英两段较高者，段对之间沿用现有段间距，
+  //                  下一段对因此在两栏同一高度起始。
   // 填写链接（input.reserveBottomMm = 22）：先从可用高度中扣除底部二维码区，
   //                  再按现有规则核算标题与正文。
-  // 返回 { ok:true, ... } 或 { ok:false, reason: 'config'|'width'|'height', ... }
-  // 各种返回均带 zhLines / enLines（中文/英文行数；宽度失败无法规划时为 null），
+  // 返回 { ok:true, ... } 或 { ok:false, reason: 'config'|'mismatch'|'width'|'height', ... }
+  // 各种返回均带 zhLines / enLines（宽度/段数失败无法规划时为 null），
   // 供修订对照表展示两版行数。
   function tryLayout(input, widthMm, heightMm, bodyPx) {
     var reserveMm = input.reserveBottomMm || 0;
@@ -224,6 +242,23 @@
       };
     }
 
+    var paired = dual && !!input.paired;
+
+    // 段落对齐：先按非空段落配对，两侧段数不等即指出差异并禁用成品打印。
+    // 段数与字号无关，任何字号下都直接失败（computeLayout 立即返回）。
+    if (paired) {
+      var zhParaCount = hasZh
+        ? countParagraphs(input.bodyTrim, input.protectedWords) : 0;
+      var enParaCount = hasEn ? countParagraphs(input.enTrim) : 0;
+      if (zhParaCount !== enParaCount) {
+        return {
+          ok: false, reason: 'mismatch', bodyPx: bodyPx,
+          zhParaCount: zhParaCount, enParaCount: enParaCount,
+          zhLines: null, enLines: null
+        };
+      }
+    }
+
     // 标题横跨整签（两种模式均按内容全宽规划，允许折行）；标题与中文正文应用保护表
     var titlePlan = null;
     var titleWidthFail = false;
@@ -268,13 +303,14 @@
 
     if (!titlePlan && !zhPlan && !enPlan) {
       return {
-        ok: true, dual: dual, titlePlan: null, zhPlan: null, enPlan: null,
+        ok: true, dual: dual, paired: paired, pairCount: 0,
+        titlePlan: null, zhPlan: null, enPlan: null,
         bodyPx: bodyPx, titlePx: titlePx, contentH: 0, colWMm: colW / PX_PER_MM,
         zhLines: 0, enLines: 0
       };
     }
 
-    // 高度核算：标题（横跨整签）+ 标题间距 + 较高一栏
+    // 高度核算：标题（横跨整签）+ 标题间距 + 正文
     var titleH = 0, titleGap = 0;
     if (titlePlan) {
       titleH = titlePlan.totalLines * titlePx * TITLE_LINE_HEIGHT;
@@ -282,12 +318,36 @@
     }
     var zhH = columnHeight(zhPlan, bodyPx);
     var enH = columnHeight(enPlan, bodyPx);
-    var bodyH = Math.max(zhH, enH);
+
+    var pairHeights = null;
+    var pairCount = 0;
+    var bodyH;
+    if (paired && zhPlan && enPlan &&
+        zhPlan.paragraphs.length === enPlan.paragraphs.length) {
+      // 段落对齐：每段对高度取双方较高者；段对之间沿用现有段间距。
+      // 下一段对在两栏同一高度起始，两栏不再各排各的段间距。
+      pairCount = zhPlan.paragraphs.length;
+      pairHeights = [];
+      bodyH = 0;
+      for (var pi = 0; pi < pairCount; pi++) {
+        var ph = Math.max(
+          paragraphHeight(zhPlan.paragraphs[pi], bodyPx),
+          paragraphHeight(enPlan.paragraphs[pi], bodyPx)
+        );
+        pairHeights.push(ph);
+        bodyH += ph;
+      }
+      if (pairCount > 1) bodyH += (pairCount - 1) * bodyPx * PARA_GAP_PX_FACTOR;
+    } else {
+      // 独立双栏：高度按较高一栏（其内部段间距已计入 columnHeight）
+      bodyH = Math.max(zhH, enH);
+    }
     var totalH = titleH + titleGap + bodyH;
 
     if (totalH > contentH + 0.75) {
       return {
-        ok: false, reason: 'height', bodyPx: bodyPx,
+        ok: false, reason: 'height', bodyPx: bodyPx, paired: paired,
+        pairCount: pairCount, pairHeights: pairHeights,
         totalH: totalH, contentH: contentH,
         zhH: zhH, enH: enH, titleH: titleH + titleGap,
         zhLines: zhPlan ? zhPlan.totalLines : 0,
@@ -296,7 +356,9 @@
     }
 
     return {
-      ok: true, dual: dual, titlePlan: titlePlan, zhPlan: zhPlan, enPlan: enPlan,
+      ok: true, dual: dual, paired: paired, pairCount: pairCount,
+      pairHeights: pairHeights,
+      titlePlan: titlePlan, zhPlan: zhPlan, enPlan: enPlan,
       bodyPx: bodyPx, titlePx: titlePx, contentH: totalH,
       zhH: zhH, enH: enH, colWMm: colW / PX_PER_MM,
       zhLines: zhPlan ? zhPlan.totalLines : 0,
@@ -311,6 +373,7 @@
       var r = tryLayout(input, input.widthMm, input.heightMm, px);
       if (r.ok) return r;
       if (r.reason === 'config') return r;     // 尺寸配置错误，与字号无关
+      if (r.reason === 'mismatch') return r;   // 中英段数不等，与字号无关
       if (r.reason === 'width') {
         if (px === MIN_BODY) return r;         // 最小字号仍超宽，无法挽救
         continue;
@@ -368,9 +431,14 @@
   function heightFailureMessage(result, dual, qrReserved) {
     var where = '';
     if (dual) {
-      // 较高一栏（计入标题时以正文两栏比较）
-      if (result.enH > result.zhH) where = '（英文译文栏较高）';
-      else if (result.zhH > 0) where = '（中文原文栏较高）';
+      if (result.paired) {
+        where = '（中英段落对齐，共 ' + (result.pairCount || 0) + ' 对段落，' +
+          '按段对较高者累计）';
+      } else if (result.enH > result.zhH) {
+        where = '（英文译文栏较高）';
+      } else if (result.zhH > 0) {
+        where = '（中文原文栏较高）';
+      }
     }
     var qrNote = qrReserved
       ? '（可用高度已先扣除底部 ' + QR_BAND_MM + 'mm 二维码区）'
@@ -379,28 +447,61 @@
       Math.round(result.totalH / PX_PER_MM) + 'mm，可用 ' +
       Math.round(result.contentH / PX_PER_MM) + 'mm）。\n' +
       '请加高标签或精简文案' +
-      (qrReserved ? '，或清空链接恢复原版式' : '') + '——不会截断显示。';
+      (qrReserved ? '，或清空链接恢复原版式' : '') +
+      (result.paired ? '，或关闭「中英段落对齐」恢复两栏各自排版' : '') +
+      '——不会截断显示。';
+  }
+
+  // 段落对齐模式下中英段数不一致：指出两侧段数差异并禁用打印
+  function mismatchFailureMessage(result) {
+    var diff = result.zhParaCount - result.enParaCount;
+    var side = diff > 0 ? '中文原文' : '英文译文';
+    return '中英段落对齐失败：中文正文有 ' + result.zhParaCount +
+      ' 个非空段落，英文译文有 ' + result.enParaCount +
+      ' 个，无法一一配对（' + side + '多 ' + Math.abs(diff) +
+      ' 段）。请用回车把两侧段落数调整为一致，或关闭「中英段落对齐」开关；' +
+      '段数一致前不生成预览成品，也不能打印。';
   }
 
   // ---------- 渲染 ----------
+  function buildParagraphEl(para) {
+    var p = document.createElement('div');
+    p.className = 't-paragraph';
+    para.lines.forEach(function (lineText) {
+      var div = document.createElement('div');
+      div.className = 't-line';
+      div.textContent = lineText;
+      p.appendChild(div);
+    });
+    return p;
+  }
+
   function buildLines(container, plan) {
     container.innerHTML = '';
     plan.paragraphs.forEach(function (para) {
-      var p = document.createElement('div');
-      p.className = 't-paragraph';
-      para.lines.forEach(function (lineText) {
-        var div = document.createElement('div');
-        div.className = 't-line';
-        div.textContent = lineText;
-        p.appendChild(div);
-      });
-      container.appendChild(p);
+      container.appendChild(buildParagraphEl(para));
     });
   }
 
-  function setDualMode(dual) {
-    el.labelContent.classList.toggle('dual', !!dual);
-    el.labelBodyEn.hidden = !dual;
+  // 段落对齐：段对按顺序依次写入同一 grid 容器（中文、英文、中文、英文……），
+  // CSS grid 每行两列即一对，两列同高起始、行间距沿用 --para-gap。
+  function buildPairedLines(container, zhPlan, enPlan) {
+    container.innerHTML = '';
+    var n = Math.min(zhPlan.paragraphs.length, enPlan.paragraphs.length);
+    for (var i = 0; i < n; i++) {
+      container.appendChild(buildParagraphEl(zhPlan.paragraphs[i]));
+      container.appendChild(buildParagraphEl(enPlan.paragraphs[i]));
+    }
+  }
+
+  // mode：'single' 单栏独立 / 'dual' 双栏各自独立 / 'paired' 双栏段落对齐
+  function setDualMode(mode) {
+    var paired = mode === 'paired';
+    var dual = mode !== 'single';
+    el.labelContent.classList.toggle('dual', dual);
+    el.labelContent.hidden = paired;
+    el.labelBodyEn.hidden = !dual || paired;
+    el.labelContentPaired.hidden = !paired;
   }
 
   var lastGood = null;
@@ -446,13 +547,15 @@
     }
 
     el.labelBody.innerHTML = '';
-    if (result.zhPlan) {
-      buildLines(el.labelBody, result.zhPlan);
-    }
-
     el.labelBodyEn.innerHTML = '';
-    if (result.enPlan) {
-      buildLines(el.labelBodyEn, result.enPlan);
+    el.labelContentPaired.innerHTML = '';
+
+    if (result.paired && result.zhPlan && result.enPlan) {
+      // 段落对齐成品：预览与打印共用同一 grid 布局
+      buildPairedLines(el.labelContentPaired, result.zhPlan, result.enPlan);
+    } else {
+      if (result.zhPlan) buildLines(el.labelBody, result.zhPlan);
+      if (result.enPlan) buildLines(el.labelBodyEn, result.enPlan);
     }
 
     // 二维码：填写合法链接时固定在底部 22mm 预留区内居中显示
@@ -472,6 +575,7 @@
       Math.round(result.titlePx * 10) / 10 + 'px）';
     if (result.dual) {
       info += '，双栏栏宽约 ' + Math.round(result.colWMm) + 'mm';
+      if (result.paired) info += '，段落对齐 ' + result.pairCount + ' 对';
       if (result.zhPlan) info += '，中文 ' + result.zhPlan.totalLines + ' 行';
       if (result.enPlan) info += '，英文 ' + result.enPlan.totalLines + ' 行';
     } else if (result.zhPlan) {
@@ -499,6 +603,9 @@
     var msg, tag = '';
     if (result.reason === 'config') {
       msg = result.message;
+    } else if (result.reason === 'mismatch') {
+      msg = mismatchFailureMessage(result);
+      tag = '段数不一致';
     } else if (result.reason === 'width') {
       msg = widthFailureMessage(result, input.dual);
       tag = '超宽';
@@ -579,6 +686,13 @@
         bad: true
       };
     }
+    if (r.reason === 'mismatch') {
+      return {
+        text: '✗ 段数不一致：中文 ' + r.zhParaCount + ' 段 / 英文 ' +
+          r.enParaCount + ' 段，禁印',
+        bad: true
+      };
+    }
     return { text: '✗ ' + (r.message || '尺寸无效'), bad: true };
   }
 
@@ -586,6 +700,9 @@
     if (r.ok) return r.bodyPx + 'px 可容纳';
     if (r.reason === 'width') return '超宽排不下';
     if (r.reason === 'height') return '超高排不下';
+    if (r.reason === 'mismatch') {
+      return '中英段数不一致（' + r.zhParaCount + ' / ' + r.enParaCount + '）';
+    }
     return '尺寸无效';
   }
 
@@ -636,9 +753,18 @@
     input.bodyTrim = input.body.trim();
     input.enTrim = input.bodyEn.trim();
     input.dual = input.enTrim.length > 0;
+    input.paired = input.dual && el.paraAlign.checked;
+
+    // 段落对齐开关仅在中英双栏时可用；单栏时恢复现有独立布局
+    el.paraAlign.disabled = !input.dual;
+    el.paraAlignHint.textContent = !input.dual
+      ? '填写英文译文进入双栏后可用'
+      : (input.paired
+          ? '已开启：中英段落一一配对、同高起始'
+          : '已关闭：两栏按各自内容独立排版');
 
     // 展品介绍链接 → 底部二维码；非法或无法编码时报错并禁用打印，空链接恢复原版式
-    setDualMode(input.dual);
+    setDualMode(input.paired ? 'paired' : (input.dual ? 'dual' : 'single'));
     var qrParsed = parseQrLink(el.qrLink.value);
     var qrError = qrParsed && qrParsed.error ? qrParsed.error : null;
     currentQr = null;
@@ -721,7 +847,8 @@
       widthMm: input.widthMm,
       heightMm: input.heightMm,
       protectedWords: input.protectedWords,
-      reserveBottomMm: input.reserveBottomMm
+      reserveBottomMm: input.reserveBottomMm,
+      paired: input.paired
     };
     revInput.titleTrim = input.titleTrim;
     revInput.bodyTrim = revTrim;
@@ -755,6 +882,7 @@
     el.labelTitle.innerHTML = '';
     el.labelBody.innerHTML = '';
     el.labelBodyEn.innerHTML = '';
+    el.labelContentPaired.innerHTML = '';
   }
 
   function setStatus(text, kind) {
@@ -806,6 +934,7 @@
     el.title.addEventListener(evt, schedule);
     el.body.addEventListener(evt, schedule);
     el.bodyEn.addEventListener(evt, schedule);
+    el.paraAlign.addEventListener(evt, schedule);
     el.qrLink.addEventListener(evt, schedule);
     el.protect.addEventListener(evt, schedule);
     el.widthMm.addEventListener(evt, schedule);
