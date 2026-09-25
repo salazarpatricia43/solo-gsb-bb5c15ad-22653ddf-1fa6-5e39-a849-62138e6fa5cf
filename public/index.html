@@ -33,6 +33,11 @@
       <textarea id="bodyEn" rows="6" placeholder="填写后进入中英对照双栏模式：标题横跨整签，中文原文与译文左右并列。"></textarea>
     </label>
 
+    <label class="field check-field" id="alignParasField">
+      <input type="checkbox" id="alignParas">
+      <span class="check-label">段落对齐（中英段落一一配对、每对同高起始；仅双栏可用，两侧段数须一致）</span>
+    </label>
+
     <label class="field">
       <span class="field-label">展品介绍链接（可选，https:// 开头，UTF-8 ≤ 100 字节）</span>
       <input id="qrLink" type="text" placeholder="如：https://example.com/item/123 ；填写后展签底部生成二维码">
@@ -97,6 +102,10 @@
         <li><strong>中英对照双栏</strong>：填写英文译文后，标题横跨整签，中文原文与译文在正文区左右并列（栏间距 6mm），
           两栏按各自实际栏宽独立断行，取<strong>两栏都能容纳的最大共享字号</strong>，高度按较高一栏与标题共同核算；
           译文留空则保持现有单栏。</li>
+        <li><strong>段落对齐</strong>（双栏可选开关）：中英正文按换行分成非空段落一一配对，每段仍按现有栏宽、
+          保护词与标点规则独立断行；段对高度取双方较高者，下一对从两栏同一高度起始，段对之间沿用现有段间距；
+          字号按段对高度总和连同标题与二维码预留区核算；两侧段数不等时指出差异并禁用打印；
+          关闭开关即恢复独立双栏。</li>
         <li><strong>展品介绍二维码</strong>：填写 https:// 开头的链接（UTF-8 ≤ 100 字节、不含空白字符）后，
           浏览器本地生成二维码（不依赖外部服务）：展签底部固定留出 22mm 区域，18mm 码图居中、四周留白 ≥2mm；
           排版先扣除该区域再为标题与正文选最大字号；链接非法或无法编码时报错并禁用打印，留空即恢复原版式。</li>
@@ -116,6 +125,7 @@
         <div id="labelContent" class="label-content">
           <div id="labelBody" class="label-col"></div>
           <div id="labelBodyEn" class="label-col label-col-en"></div>
+          <div id="labelPairs" class="label-pairs" hidden></div>
         </div>
         <div id="labelQr" class="label-qr" hidden><canvas id="qrCanvas"></canvas></div>
         <div id="labelError" class="label-error" hidden></div>

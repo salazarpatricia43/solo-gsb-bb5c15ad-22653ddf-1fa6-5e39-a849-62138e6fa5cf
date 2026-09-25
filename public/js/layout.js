@@ -20,6 +20,10 @@
  *
  * 超宽失败：planText 返回 { error:'width', overflows:[...] }，
  * overflows 列出每一个超出行宽的不可拆整体（英文单词或保护词）。
+ *
+ * 段落对齐双栏（planAlignedPairs）：中英各自按换行分非空段落并一一配对，
+ * 段数不等返回 { error:'paraMismatch' }；每段按上述同一套规则独立断行，
+ * 段对的高度对齐（取双方较高者）由调用方在排版/渲染层处理。
  */
 (function (global) {
   'use strict';
@@ -500,11 +504,78 @@
     return { paragraphs: out, totalLines: totalLines, maxLineWidth: maxLineWidth };
   }
 
+  /**
+   * 段落对齐双栏规划（中英对照「段落对齐」模式）。
+   * 两侧各自按换行分为非空段落，按顺序一一配对；每段仍按现有栏宽、
+   * 保护词（仅中文侧）与标点避头尾规则独立断行，仅全文最后一段末行
+   * 免空白代价（与 planText 一致）。段对高度由调用方取双方较高者核算。
+   *
+   * @param {string} zhText 中文正文
+   * @param {string} enText 英文译文
+   * @param {number} maxWidth 栏宽（px，两栏相同）
+   * @param {(s:string)=>number} measure 文本宽度函数（px）
+   * @param {string[]} [protectedWords] 中文专名保护词表（仅中文侧应用）
+   * @returns {{pairs:Array<{zh:{lines,widths,tokens},en:{lines,widths,tokens}}>,
+   *            zhLines:number, enLines:number, zhParas:number, enParas:number}|
+   *           {error:'paraMismatch', zhParas:number, enParas:number}|
+   *           {error:'width', zhOverflows:Array, enOverflows:Array}}
+   */
+  function planAlignedPairs(zhText, enText, maxWidth, measure, protectedWords) {
+    var zhParas = tokenize(zhText, protectedWords);
+    var enParas = tokenize(enText);
+    if (zhParas.length !== enParas.length) {
+      return { error: 'paraMismatch', zhParas: zhParas.length, enParas: enParas.length };
+    }
+
+    var pairs = [];
+    var zhLines = 0, enLines = 0;
+    var zhOverflows = [], enOverflows = [];
+    var seenZh = Object.create(null), seenEn = Object.create(null);
+    var failed = false;
+
+    function collect(list, seen, o) {
+      var key = o.text + '|' + o.protect;
+      if (!seen[key]) { seen[key] = true; list.push(o); }
+    }
+
+    for (var i = 0; i < zhParas.length; i++) {
+      var last = i === zhParas.length - 1;
+      var zr = planParagraph(zhParas[i], maxWidth, measure, last);
+      var er = planParagraph(enParas[i], maxWidth, measure, last);
+      var pairFailed = false;
+      if (zr.overflows.length || zr.infeasible) {
+        pairFailed = true;
+        zr.overflows.forEach(function (o) { collect(zhOverflows, seenZh, o); });
+      }
+      if (er.overflows.length || er.infeasible) {
+        pairFailed = true;
+        er.overflows.forEach(function (o) { collect(enOverflows, seenEn, o); });
+      }
+      if (pairFailed) { failed = true; continue; } // 继续处理其余段对，尽量列全超宽词
+      if (!failed) {
+        pairs.push({
+          zh: { lines: zr.lines, widths: zr.widths, tokens: zr.tokens },
+          en: { lines: er.lines, widths: er.widths, tokens: er.tokens }
+        });
+        zhLines += zr.lines.length;
+        enLines += er.lines.length;
+      }
+    }
+    if (failed) {
+      return { error: 'width', zhOverflows: zhOverflows, enOverflows: enOverflows };
+    }
+    return {
+      pairs: pairs, zhLines: zhLines, enLines: enLines,
+      zhParas: zhParas.length, enParas: enParas.length
+    };
+  }
+
   var api = {
     PX_PER_MM: PX_PER_MM,
     tokenize: tokenize,
     planParagraph: planParagraph,
     planText: planText,
+    planAlignedPairs: planAlignedPairs,
     isWordCode: isWordCode,
     isCJKCode: isCJKCode
   };

@@ -54,6 +54,18 @@ html, body {
 .field-row { display: flex; gap: 12px; }
 .field-row .field { flex: 1; }
 
+/* 段落对齐开关（checkbox 行） */
+.check-field {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.check-field input[type="checkbox"] { width: auto; margin: 2px 0 0; }
+.check-field.is-disabled { opacity: 0.55; cursor: default; }
+
 .field-label {
   display: block;
   font-size: 12px;
@@ -273,8 +285,27 @@ button:disabled { background: #aaa5; cursor: not-allowed; }
   min-width: 0;
 }
 
+/* 段落对齐双栏：每对一行，两列等宽（与独立双栏同栏宽、同 6mm 栏间距），
+   行高由较高一方撑开，下一对因此从两栏同一高度起始；对间沿用段间距 */
+.label-pairs {
+  font-size: var(--body-size);
+  line-height: 1.6;
+}
+.label-pairs[hidden] { display: none; }
+.t-pair {
+  display: flex;
+  align-items: flex-start;
+  gap: 6mm;
+}
+.t-pair + .t-pair { margin-top: var(--para-gap); }
+.t-pair-col {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
 .label-title .t-line,
-.label-col .t-line {
+.label-col .t-line,
+.t-pair-col .t-line {
   white-space: pre;
   display: block;
 }
